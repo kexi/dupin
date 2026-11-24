@@ -32,6 +32,7 @@ struct App {
 
 pub struct AppsProvider {
     roots: Vec<PathBuf>,
+    core_services: Option<PathBuf>,
     index: Mutex<Option<(u64, Vec<App>)>>,
     revision: AtomicU64,
     /// Each bundle's names, kept while its modification time stays the same: reading them
@@ -44,7 +45,7 @@ type Names = (String, Vec<String>);
 
 impl AppsProvider {
     /// `/Applications`, `/System/Applications` and `~/Applications`, with their subfolders
-    /// (`Utilities` among them).
+    /// (`Utilities` among them), plus Finder and apps directly under CoreServices/Applications.
     pub fn standard() -> Self {
         let mut roots = vec![
             PathBuf::from("/Applications"),
@@ -53,12 +54,13 @@ impl AppsProvider {
         if let Some(home) = std::env::var_os("HOME") {
             roots.push(Path::new(&home).join("Applications"));
         }
-        Self::with_roots(roots)
+        Self::with_roots(roots, Some(PathBuf::from("/System/Library/CoreServices")))
     }
 
-    fn with_roots(roots: Vec<PathBuf>) -> Self {
+    fn with_roots(roots: Vec<PathBuf>, core_services: Option<PathBuf>) -> Self {
         AppsProvider {
             roots,
+            core_services,
             index: Mutex::new(None),
             revision: AtomicU64::new(0),
             names: Mutex::new(HashMap::new()),
@@ -105,7 +107,7 @@ impl AppsProvider {
         {
             return apps.clone();
         }
-        let apps: Vec<App> = scan(&self.roots)
+        let apps: Vec<App> = scan(&self.roots, self.core_services.as_deref())
             .into_iter()
             .map(|app| {
                 let (display, extra) = self.names_of(&app.icon);
@@ -222,12 +224,21 @@ fn rank(apps: &[App], query: &str, limit: usize) -> Vec<Item> {
         .collect()
 }
 
-/// Every `.app` under `roots`, one entry per name: the first root wins, so an app in
-/// `/Applications` hides a same-named copy further down the list.
-fn scan(roots: &[PathBuf]) -> Vec<App> {
+/// Keep one entry per bundle name, giving the usual application folders precedence.
+fn scan(roots: &[PathBuf], core_services: Option<&Path>) -> Vec<App> {
     let mut apps = Vec::new();
     for root in roots {
-        walk(root, 0, &mut apps);
+        walk(root, MAX_DEPTH, &mut apps);
+    }
+    if let Some(core_services) = core_services {
+        let finder = core_services.join("Finder.app");
+        if let Ok(kind) = fs::symlink_metadata(&finder).map(|metadata| metadata.file_type())
+            && is_app_directory(&finder, kind)
+            && let Some(finder) = bundle_app(finder, kind)
+        {
+            apps.push(finder);
+        }
+        walk(&core_services.join("Applications"), 1, &mut apps);
     }
     let mut seen = std::collections::HashSet::new();
     apps.retain(|a: &App| seen.insert(a.name.clone()));
@@ -249,34 +260,43 @@ fn is_bundle(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "app")
 }
 
-fn walk(dir: &Path, depth: usize, out: &mut Vec<App>) {
+fn is_app_directory(path: &Path, kind: fs::FileType) -> bool {
+    // A symlink can point to an app stored outside the application folders.
+    kind.is_dir() || (kind.is_symlink() && path.is_dir())
+}
+
+fn bundle_app(path: PathBuf, kind: fs::FileType) -> Option<App> {
+    let name = path.file_stem()?.to_str()?.to_owned();
+    let icon = if kind.is_symlink() {
+        fs::canonicalize(&path).unwrap_or_else(|_| path.clone())
+    } else {
+        path.clone()
+    };
+    Some(App {
+        name,
+        aliases: Vec::new(),
+        path,
+        icon,
+    })
+}
+
+fn walk(dir: &Path, remaining_depth: usize, out: &mut Vec<App>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
         let Ok(kind) = entry.file_type() else { continue };
-        // Bundles are directories; follow symlinks too (Xcode-select style links into /Applications).
-        let is_dir = kind.is_dir() || (kind.is_symlink() && path.is_dir());
-        if !is_dir {
+        let is_directory = is_app_directory(&path, kind);
+        if !is_directory {
             continue;
         }
         if is_bundle(&path) {
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                let icon = if kind.is_symlink() {
-                    fs::canonicalize(&path).unwrap_or_else(|_| path.clone())
-                } else {
-                    path.clone()
-                };
-                out.push(App {
-                    name: name.to_owned(),
-                    aliases: Vec::new(),
-                    path,
-                    icon,
-                });
+            if let Some(app) = bundle_app(path, kind) {
+                out.push(app);
             }
-        } else if depth + 1 < MAX_DEPTH {
-            walk(&path, depth + 1, out);
+        } else if remaining_depth > 1 {
+            walk(&path, remaining_depth - 1, out);
         }
     }
 }
@@ -316,7 +336,7 @@ mod tests {
             "Xcode.app/Contents/Applications/Instruments.app",
             "NotAnApp",
         ]);
-        let names: Vec<_> = scan(std::slice::from_ref(&root))
+        let names: Vec<_> = scan(std::slice::from_ref(&root), None)
             .into_iter()
             .map(|a| a.name)
             .collect();
@@ -328,12 +348,44 @@ mod tests {
     }
 
     #[test]
+    fn core_services_adds_finder_and_direct_apps_after_standard_folders() {
+        let root = tree(&[
+            "Applications/Archive Utility.app",
+            "CoreServices/Finder.app/Contents/Applications/Helper.app",
+            "CoreServices/Other.app",
+            "CoreServices/Applications/Archive Utility.app",
+            "CoreServices/Applications/Screen Sharing.app",
+            "CoreServices/Applications/Nested/Hidden.app",
+        ]);
+        let apps = scan(&[root.join("Applications")], Some(&root.join("CoreServices")));
+        let paths: Vec<_> = apps.into_iter().map(|app| app.path).collect();
+        assert_eq!(
+            paths,
+            [
+                root.join("Applications/Archive Utility.app"),
+                root.join("CoreServices/Finder.app"),
+                root.join("CoreServices/Applications/Screen Sharing.app"),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_core_services_keeps_standard_apps() {
+        let root = tree(&["Applications/Mail.app"]);
+        let apps = scan(&[root.join("Applications")], Some(&root.join("CoreServices")));
+        let paths: Vec<_> = apps.into_iter().map(|app| app.path).collect();
+        assert_eq!(paths, [root.join("Applications/Mail.app")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_linked_bundle_takes_its_icon_from_the_target() {
         let root = tree(&["Real/Linked.app/Contents"]);
         let apps_dir = root.join("Apps");
         fs::create_dir_all(&apps_dir).unwrap();
         std::os::unix::fs::symlink(root.join("Real/Linked.app"), apps_dir.join("Linked.app")).unwrap();
-        let apps = scan(std::slice::from_ref(&apps_dir));
+        let apps = scan(std::slice::from_ref(&apps_dir), None);
         assert_eq!(apps[0].path, apps_dir.join("Linked.app"));
         assert_eq!(
             apps[0].icon,
@@ -440,7 +492,7 @@ mod tests {
     #[test]
     fn invalidating_the_index_picks_up_new_bundles() {
         let root = tree(&[]);
-        let provider = AppsProvider::with_roots(vec![root.clone()]);
+        let provider = AppsProvider::with_roots(vec![root.clone()], None);
         assert!(provider.apps().is_empty());
 
         fs::create_dir_all(root.join("New App.app")).unwrap();
@@ -454,7 +506,7 @@ mod tests {
     fn folder_watcher_invalidates_the_index_after_a_bundle_is_added() {
         let root = tree(&[]);
         let missing = root.join("Applications");
-        let provider = Arc::new(AppsProvider::with_roots(vec![missing.clone()]));
+        let provider = Arc::new(AppsProvider::with_roots(vec![missing.clone()], None));
         assert!(provider.apps().is_empty());
         let (changed, event) = std::sync::mpsc::channel();
         let watcher = provider
